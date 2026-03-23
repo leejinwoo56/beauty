@@ -380,8 +380,8 @@ def _detect_smas_thick_stripe(
     L2: np.ndarray,
     h: int,
     w: int,
-    half_win: int = 20,
-    l1_margin: int = 130,
+    half_win: int = 25,
+    l1_margin: int = 100,
     bright_factor: float = 0.5,
 ) -> np.ndarray:
     """
