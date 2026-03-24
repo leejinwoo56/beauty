@@ -398,14 +398,21 @@ def _detect_smas_thick_stripe(
     L2_y = int(L2.mean())
     enh_f = enh.astype(np.float32)
 
+    # SMAS zone 자체가 없는 경우
+    if L2_y <= L1_y:
+        print(f"[ThickStripe] 실패 - SMAS zone 없음 (L1_y={L1_y} >= L2_y={L2_y})")
+        return np.zeros((h, w), dtype=bool)
+
     best_sum = -1.0
     best_y = -1
+    n_filtered = 0
 
     for y_center in range(L2_y, L1_y - 1, -1):
         y_top = max(0, y_center - half_win)
         y_bot = min(h - 1, y_center + half_win)
 
         if y_top <= L1_y + l1_margin:
+            n_filtered += 1
             continue
 
         win_sum = float(enh_f[y_top:y_bot + 1, :].sum())
@@ -414,13 +421,13 @@ def _detect_smas_thick_stripe(
             best_y = y_center
 
     if best_y < 0:
-        print("[ThickStripe] 탐지 실패")
+        print(f"[ThickStripe] 실패 - 유효 window 없음 "
+              f"(L1_y={L1_y}, L2_y={L2_y}, l1_margin={l1_margin}, "
+              f"필터된 window={n_filtered}개 → SMAS zone이 너무 얇음)")
         return np.zeros((h, w), dtype=bool)
 
     y_top = max(0, best_y - half_win)
     y_bot = min(h - 1, best_y + half_win)
-    print(f"[ThickStripe] best_y={best_y}, brightness_sum={best_sum:.0f}, "
-          f"win=[{y_top},{y_bot}]")
 
     # window 내 enh 밝기로 직접 threshold (smas_bright 무관)
     win_patch = enh_f[y_top:y_bot + 1, :]
@@ -435,6 +442,15 @@ def _detect_smas_thick_stripe(
     # 세로 방향으로 closing → 줄기 매끄럽게
     ker_v = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     result = cv2.morphologyEx(result.astype(np.uint8), cv2.MORPH_CLOSE, ker_v).astype(bool)
+
+    if not result.any():
+        print(f"[ThickStripe] 실패 - threshold 초과 픽셀 없음 "
+              f"(best_y={best_y}, thr={thr:.1f}, "
+              f"window mean={win_patch.mean():.1f}, std={win_patch.std():.1f})")
+        return result
+
+    print(f"[ThickStripe] 성공 - best_y={best_y}, brightness_sum={best_sum:.0f}, "
+          f"win=[{y_top},{y_bot}], area={result.sum()}")
     return result
 
 
