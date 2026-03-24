@@ -55,16 +55,11 @@ def mask_to_bbox(mask: np.ndarray) -> list[int]:
 
 def build_smas_annotation(layer_masks: dict, crop_shape: tuple, file_name: str) -> dict:
     """
-    SMAS 관련 마스크(smas + smas_bright + smas_thick)를 합쳐
-    SA-1B 스타일 JSON annotation dict를 반환.
+    smas_thick 마스크만 사용해 SA-1B 스타일 JSON annotation dict를 반환.
     """
     h, w = crop_shape[:2]
 
-    # SMAS 전체 마스크 = 세 레이어의 union
-    smas_mask = np.zeros((h, w), dtype=bool)
-    for key in ("smas", "smas_bright", "smas_thick"):
-        if key in layer_masks:
-            smas_mask |= layer_masks[key].astype(bool)
+    smas_mask = layer_masks.get("smas_thick", np.zeros((h, w), dtype=bool)).astype(bool)
 
     area = int(smas_mask.sum())
     bbox = mask_to_bbox(smas_mask)
