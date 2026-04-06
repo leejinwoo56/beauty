@@ -1,4 +1,4 @@
- """
+"""
 lora_medsam2.py
 ---------------
 MedSAM2 이미지 인코더(Hiera backbone)에 LoRA를 적용하는 모듈.
@@ -117,12 +117,44 @@ def apply_lora_to_model(
         cls_name = type(module).__name__
         if cls_name == "MultiScaleAttention":
             original_qkv = module.qkv  # nn.Linear(dim, dim_out * 3)
-            module.qkv = LoRAQKV(original_qkv, r=r, lora_alpha=lora_alpha)
+            device = next(original_qkv.parameters()).device
+            module.qkv = LoRAQKV(original_qkv, r=r, lora_alpha=lora_alpha).to(device)
             replaced += 1
 
     print(f"[LoRA] {replaced}개의 MultiScaleAttention.qkv 레이어에 LoRA 적용 완료")
     print(f"       rank={r}, alpha={lora_alpha}")
     return replaced
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SAMed-style 기본 프롬프트 임베딩 추가
+# ──────────────────────────────────────────────────────────────────────────────
+
+def add_default_prompt(model: nn.Module, n_tokens: int = 2) -> nn.Parameter:
+    """
+    SAMed 방식의 학습 가능한 기본 프롬프트 임베딩을 모델에 추가.
+
+    prompt encoder 를 우회하고 mask decoder 에 직접 주입되는
+    task-specific sparse embedding.  학습을 통해 "SMAS를 찾아라"는
+    신호를 인코딩하게 됨.
+
+    apply_lora_to_model() 호출 이후에 실행해야 함.
+    (전체 freeze 이후 새 Parameter 를 추가하므로 requires_grad=True 유지)
+
+    Args:
+        model   : apply_lora_to_model 이 호출된 SAM2Base 인스턴스
+        n_tokens: 학습할 프롬프트 토큰 수 (SAMed 논문 기본값 = 4,
+                  가벼운 실험에는 2 권장)
+
+    Returns:
+        nn.Parameter [1, n_tokens, 256]
+    """
+    embed_dim = model.hidden_dim  # 256
+    prompt = nn.Parameter(torch.zeros(1, n_tokens, embed_dim))
+    nn.init.trunc_normal_(prompt, std=0.02)
+    model.default_prompt_embedding = prompt  # model에 등록 → named_parameters()에 포함
+    print(f"[LoRA] SAMed 기본 프롬프트 추가: {n_tokens}개 토큰 × {embed_dim}dim")
+    return prompt
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -177,6 +209,7 @@ def save_lora_checkpoint(model: nn.Module, path: str):
         name: param
         for name, param in model.state_dict().items()
         if ("lora_" in name) or ("sam_mask_decoder" in name)
+        or ("default_prompt_embedding" in name)
     }
     torch.save(state, path)
     print(f"[LoRA] 체크포인트 저장: {path} ({len(state)}개 텐서)")
@@ -186,7 +219,7 @@ def load_lora_checkpoint(model: nn.Module, path: str, strict: bool = False):
     """저장된 LoRA 체크포인트를 모델에 로드."""
     state = torch.load(path, map_location="cpu")
     missing, unexpected = model.load_state_dict(state, strict=strict)
-    print(f"[LoRA] 체크포인트 로드: {path}")
+    print(f"[LoRA] 체크포인트 로드: {paths}")
     if missing:
         print(f"  missing keys : {missing[:5]}{'...' if len(missing) > 5 else ''}")
     if unexpected:

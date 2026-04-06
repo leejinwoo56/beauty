@@ -87,10 +87,13 @@ class SMASDataset(Dataset):
         if not frames_root.exists():
             raise FileNotFoundError(f"result_resolution 폴더 없음: {frames_root}")
 
+        exclude = {"output41", "output42"}
         for output_dir in sorted(masks_root.iterdir()):
             if not output_dir.is_dir():
                 continue
             output_name = output_dir.name          # e.g. "output1"
+            if output_name in exclude:
+                continue
             frame_dir = frames_root / output_name / "frames"
             if not frame_dir.exists():
                 continue
@@ -228,29 +231,29 @@ class BCEDiceLoss(nn.Module):
 
 def forward_single_image(model, images: torch.Tensor):
     """
-    단일 이미지 세그멘테이션 forward pass (메모리 없음, 프롬프트 없음).
+    단일 이미지 세그멘테이션 forward pass.
+
+    model.default_prompt_embedding 이 있으면 SAMed-style로
+    mask decoder 에 직접 주입. 없으면 padding token 사용 (fallback).
 
     Args:
-        model  : SAM2Base (LoRA 적용됨)
+        model  : SAM2Base (LoRA + default prompt 적용됨)
         images : [B, 3, 512, 512]  float32
 
     Returns:
         high_res_masks : [B, 1, 512, 512]  (sigmoid 전 logits)
     """
     B = images.shape[0]
-    C = model.hidden_dim  # 256
 
-    # 1) 이미지 인코딩 (forward_image 가 conv_s0/s1 도 적용함)
+    # 1) 이미지 인코딩
     backbone_out = model.forward_image(images)
 
-    # 2) Backbone feature 준비 (FPN 처리, flatten)
+    # 2) Backbone feature 준비
     _, vision_feats, vision_pos_embeds, feat_sizes = model._prepare_backbone_features(
         backbone_out
     )
-    # vision_feats[-1] : [HW, B, C] = [1024, B, 256]
 
-    # 3) 메모리 없이 첫 프레임 처리 (directly_add_no_mem_embed 경로)
-    #    is_init_cond_frame=True, output_dict 비어 있음
+    # 3) 메모리 없이 첫 프레임 처리
     empty_output_dict = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
     pix_feat = model._prepare_memory_conditioned_features(
         frame_idx=0,
@@ -263,24 +266,52 @@ def forward_single_image(model, images: torch.Tensor):
     )
     # pix_feat : [B, 256, 32, 32]
 
-    # 4) High-res features (backbone_fpn[0]=128x128, backbone_fpn[1]=64x64)
-    #    (이미 forward_image 에서 conv_s0/s1 적용됨)
+    # 4) High-res features
     high_res_features = [
         backbone_out["backbone_fpn"][0],   # [B, 32, 128, 128]
         backbone_out["backbone_fpn"][1],   # [B, 64, 64, 64]
     ]
 
-    # 5) SAM 헤드 forward (프롬프트 없음 → padding point label=-1 자동 사용)
-    sam_outputs = model._forward_sam_heads(
-        backbone_features=pix_feat,
-        point_inputs=None,
-        mask_inputs=None,
-        high_res_features=high_res_features,
-        multimask_output=False,
-    )
-    # sam_outputs = (low_res_multimasks, high_res_multimasks, ious,
-    #                low_res_masks, high_res_masks, obj_ptr, object_score_logits)
-    high_res_masks = sam_outputs[4]  # [B, 1, 512, 512]
+    # 5) SAMed-style: learnable default prompt → mask decoder 직접 호출
+    if hasattr(model, "default_prompt_embedding"):
+        # sparse_embeddings: [B, n_tokens, 256] — task-specific 학습된 토큰
+        sparse_embeddings = model.default_prompt_embedding.to(images.device).expand(B, -1, -1)
+
+        # dense_embeddings: no_mask_embed 확장 (마스크 입력 없음)
+        H, W = feat_sizes[-1]  # (32, 32)
+        dense_embeddings = (
+            model.sam_prompt_encoder.no_mask_embed.weight
+            .reshape(1, -1, 1, 1)
+            .expand(B, -1, H, W)
+        )
+
+        (low_res_multimasks, _, _, _) = model.sam_mask_decoder(
+            image_embeddings=pix_feat,
+            image_pe=model.sam_prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+            repeat_image=False,
+            high_res_features=high_res_features,
+        )
+        low_res_multimasks = low_res_multimasks.float()
+        high_res_masks = F.interpolate(
+            low_res_multimasks,
+            size=(model.image_size, model.image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+    else:
+        # fallback: padding token (비권장)
+        sam_outputs = model._forward_sam_heads(
+            backbone_features=pix_feat,
+            point_inputs=None,
+            mask_inputs=None,
+            high_res_features=high_res_features,
+            multimask_output=False,
+        )
+        high_res_masks = sam_outputs[4]
+
     return high_res_masks
 
 
@@ -296,7 +327,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler, device, warmup_sche
         masks = masks.to(device)
 
         optimizer.zero_grad()
-        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
             pred_masks = forward_single_image(model, images)   # [B, 1, 512, 512]
             loss = criterion(pred_masks, masks)
 
@@ -424,11 +455,11 @@ class LinearWarmupScheduler:
 
 def parse_args():
     p = argparse.ArgumentParser(description="MedSAM2 + LoRA SMAS Finetuning")
-    p.add_argument("--root_dir",    required=True,
-                   help="데이터 루트 (result_resolution/, propagated_masks/ 포함)")
-    p.add_argument("--medsam2_dir", required=True,
-                   help="MedSAM2 소스 디렉토리 경로")
-    p.add_argument("--checkpoint",  required=True,
+    p.add_argument("--root_dir",    default=".",
+                   help="데이터 루트 (result_resolution/, propagated_masks/ 포함, 기본값: 현재 폴더)")
+    p.add_argument("--medsam2_dir", default="./MedSAM2",
+                   help="MedSAM2 소스 디렉토리 경로 (기본값: ./MedSAM2)")
+    p.add_argument("--checkpoint",  default="./MedSAM2/checkpoints/MedSAM2_latest.pt",
                    help="MedSAM2 체크포인트 .pt 경로")
     p.add_argument("--config",      default="configs/sam2.1_hiera_t512.yaml",
                    help="SAM2 config 파일 (medsam2_dir 기준 상대 경로)")
@@ -443,6 +474,8 @@ def parse_args():
     p.add_argument("--warmup_steps",type=int, default=100)
     p.add_argument("--val_ratio",   type=float, default=0.2)
     p.add_argument("--img_size",    type=int, default=512)
+    p.add_argument("--n_prompt_tokens", type=int, default=2,
+                   help="SAMed 기본 프롬프트 토큰 수 (기본값: 2)")
     p.add_argument("--train_decoder", action="store_true",
                    help="mask decoder 도 함께 학습")
     p.add_argument("--resume",      default=None,
@@ -456,25 +489,33 @@ def main():
     # ── 경로 설정 ──
     setup_path(args.medsam2_dir)
     from sam2.build_sam import build_sam2
-    from lora_medsam2 import apply_lora_to_model, get_trainable_params
+    from lora_medsam2 import apply_lora_to_model, add_default_prompt, get_trainable_params
     from lora_medsam2 import save_lora_checkpoint, load_lora_checkpoint
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Train] 디바이스: {device}")
 
+    # GPU 최적화
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True   # conv 자동 최적 알고리즘 선택
+        torch.backends.cuda.matmul.allow_tf32 = True  # 4090 TF32 활성화
+        torch.backends.cudnn.allow_tf32 = True
+
     # ── 모델 로드 ──
     print("[Train] 모델 로딩 중...")
-    config_path = str(Path(args.medsam2_dir) / args.config)
+    # hydra는 config를 pkg://sam2 (sam2 패키지 내부) 기준으로 검색하므로
+    # 절대경로가 아닌 패키지 상대경로만 넘겨야 함
     model = build_sam2(
-        config_file=config_path,
+        config_file=args.config,
         ckpt_path=args.checkpoint,
         device=device,
     )
     model = model.to(device)
 
-    # ── LoRA 적용 ──
+    # ── LoRA 적용 + SAMed 기본 프롬프트 추가 ──
     apply_lora_to_model(model, r=args.rank, lora_alpha=args.lora_alpha)
+    add_default_prompt(model, n_tokens=args.n_prompt_tokens)
     if args.resume:
         load_lora_checkpoint(model, args.resume)
 
@@ -490,11 +531,13 @@ def main():
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size,
-        shuffle=True, num_workers=args.num_workers, pin_memory=True
+        shuffle=True, num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=(args.num_workers > 0), prefetch_factor=4 if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size,
-        shuffle=False, num_workers=args.num_workers, pin_memory=True
+        shuffle=False, num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=(args.num_workers > 0), prefetch_factor=4 if args.num_workers > 0 else None,
     )
     print(f"[Train] train: {len(train_set)}, val: {len(val_set)}")
 
