@@ -1,0 +1,87 @@
+================================================================
+SMAS 층 탐지 프로젝트 - 진행 상황
+================================================================
+최종 업데이트: 2026-04-01
+
+================================================================
+프로젝트 개요
+================================================================
+목표: B-mode 초음파 영상에서 SMAS 층을 자동으로 segmentation
+방법: MedSAM2 finetuning (사용자 입력 없이 영상 입력 시 바로 탐지)
+데이터: 수동 검토 완료된 라벨링 데이터 약 400 프레임
+GitHub: https://github.com/leejinwoo56/beauty (폴더: medsam_finetune_lora/)
+
+================================================================
+완료된 작업
+================================================================
+[라벨링 파이프라인]
+- annotation_tool.py: 첫 프레임 수동 segmentation 도구
+- pipeline_propagate.py: MedSAM2로 이후 프레임 자동 전파
+- pipeline_review.py: 마스크 수동 검토/수정 도구
+- visualize_results.py: 최종 결과 영상화
+- 위 파이프라인으로 라벨링 데이터 약 400 프레임 확보 완료
+
+[사전 연구]
+- SAM, MedSAM 적용 시도 → 초음파 noise로 인해 탐지 실패
+- Analog 방식 SMAS 탐지 코드 구현 완료
+
+[Finetuning 코드 구성 완료 - 2026-04-01]
+- lora_medsam2.py: LoRA 모듈 구현
+  - LoRAQKV: MultiScaleAttention.qkv (fused Linear) 래퍼
+  - Q, V 에만 LoRA delta 적용 (K는 원본 유지)
+  - apply_lora_to_model(): 모델 전체 freeze 후 qkv 레이어 교체
+  - get_trainable_params(): LoRA + mask decoder 파라미터 반환
+  - save/load_lora_checkpoint(): LoRA 파라미터만 저장/로드
+
+- train_lora.py: 학습 파이프라인 구현
+  - SMASDataset: result_resolution/output{N}/frames ↔ propagated_masks/output{N} 매칭
+    - 전처리: grayscale→3ch 복사, 512×512 resize, 0.5% percentile clip, ImageNet 정규화
+  - BCEDiceLoss: BCE + Dice Loss (1:1 비율)
+  - forward_single_image(): 메모리/프롬프트 없이 단일 이미지 forward
+  - 학습 루프: AdamW + linear warmup + cosine annealing
+  - 검증 루프: Dice, IoU, Hausdorff(95th), Precision, Recall
+  - 체크포인트: best validation Dice 기준 저장
+  - 학습 로그: train_log.csv
+
+================================================================
+현재 진행 중
+================================================================
+- 학습 실행 대기 중 (데이터 준비 후 다른 컴퓨터에서 실행 예정)
+
+================================================================
+앞으로 해야 할 일
+================================================================
+[1단계: 학습 실행]
+- [ ] 데이터 준비 (result_resolution/, propagated_masks/ 경로 확인)
+- [ ] 모델 1 학습: MedSAM2 + LoRA r=4 (Q+V only)
+      python train_lora.py --root_dir <data> --medsam2_dir <MedSAM2> \
+          --checkpoint <ckpt.pt> --rank 4 --train_decoder
+- [ ] 모델 2 학습: MedSAM2 + LoRA r=8 (Q+V only)
+      위 명령어에서 --rank 8
+
+[2단계: 비교 실험]
+- [ ] 모델 1: MedSAM2 + LoRA (r=4, Q+V only)
+- [ ] 모델 2: MedSAM2 + LoRA (r=8, Q+V only)
+- [ ] 모델 3: MedSAM2 + Decoder full finetuning
+- [ ] 모델 4: MedSAM2 + LoRA + Box Prompt (analog 위치 연동)
+- [ ] 모델 5: MedSAM2 + LoRA + Semi-supervised (FixMatch)
+
+[3단계: 자동화]
+- [ ] 각 모델 지표를 Notion에 자동 업로드 (update_notion_metrics.py)
+- [ ] GitHub에 코드 업로드 (medsam_finetune_lora/)
+- [ ] 최종 모델 선정 및 추론 파이프라인 통합
+
+================================================================
+모델 성능 비교표
+================================================================
+(지표 입력 시 자동으로 Notion에 업로드됨 - update_notion_metrics.py 실행)
+
+모델명                              | Dice  | IoU   | Hausdorff | Precision | Recall
+------------------------------------|-------|-------|-----------|-----------|-------
+MedSAM2 + LoRA r=4 (Q+V)          |  -    |  -    |     -     |     -     |   -
+MedSAM2 + LoRA r=8 (Q+V)          |  -    |  -    |     -     |     -     |   -
+MedSAM2 + Decoder only             |  -    |  -    |     -     |     -     |   -
+MedSAM2 + LoRA + Box Prompt        |  -    |  -    |     -     |     -     |   -
+MedSAM2 + LoRA + Semi-supervised   |  -    |  -    |     -     |     -     |   -
+
+================================================================
