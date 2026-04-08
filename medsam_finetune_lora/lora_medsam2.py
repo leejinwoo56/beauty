@@ -219,7 +219,7 @@ def load_lora_checkpoint(model: nn.Module, path: str, strict: bool = False):
     """저장된 LoRA 체크포인트를 모델에 로드."""
     state = torch.load(path, map_location="cpu")
     missing, unexpected = model.load_state_dict(state, strict=strict)
-    print(f"[LoRA] 체크포인트 로드: {paths}")
+    print(f"[LoRA] 체크포인트 로드: {path}")
     if missing:
         print(f"  missing keys : {missing[:5]}{'...' if len(missing) > 5 else ''}")
     if unexpected:

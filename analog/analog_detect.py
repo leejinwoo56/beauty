@@ -102,15 +102,11 @@ def find_epidermis_boundary_region(
     thr = max(0.5, float(np.std(pos_grad)) * 0.8)
     rises, _ = find_peaks(pos_grad, prominence=thr, distance=max(5, h // 30))
 
-    print(f"[Epidermis] brightness rise rows: {rises.tolist()}")
-
     if len(rises) == 0:
-        print("[Epidermis] 경계를 탐지하지 못했습니다.")
         return np.zeros((h, w), dtype=bool), 0
 
     # 첫 번째 상승 지점 = 표피/진피 경계 (밝기가 올라오는 hyperechoic band 시작)
     seed_y = int(rises[0])
-    print(f"[Epidermis] seed_y = {seed_y}")
 
     # ── 열별 독립 region growing ──────────────────────────────────────────────
     # seed_y 에서의 각 열 밝기를 기준으로 위/아래 방향으로
@@ -151,7 +147,6 @@ def find_epidermis_boundary_region(
     rows = np.where(boundary_mask.any(axis=1))[0]
     boundary_max_y = int(rows[-1]) if len(rows) > 0 else seed_y
 
-    print(f"[Epidermis] boundary_max_y = {boundary_max_y}")
     return boundary_mask, boundary_max_y
 
 
@@ -165,7 +160,7 @@ def _col_argmax(col: np.ndarray, center: float, half: int,
     y1 = min(y_max, int(center) + half)
     if y1 <= y0:
         return int(center)
-    return y0 + int(np.argmax(col[y0:y1 + 1].astype(np.float32)))
+    return y0 + int(np.argmax(col[y0:y1 + 1]))
 
 
 def _propagate_line(smooth: np.ndarray, pk_y: int,
@@ -219,7 +214,6 @@ def detect_all_peak_lines(
 
     peaks, _ = find_peaks(sub, distance=min_dist, prominence=use_prom)
     peaks = peaks + start_y
-    print(f"[Peaks] {len(peaks)} peaks @ {peaks.tolist()} (prom={use_prom:.2f})")
 
     mid_x = w // 2
     return [
@@ -257,7 +251,6 @@ def select_L2_L3(
 
     if len(sorted_lines) == 1:
         # 라인이 1개뿐이면 L3만 존재, L2 없음
-        print(f"[Lines] L1_y={L1_y}, L2=없음, L3 y≈{int(L3_y)}")
         return None, L3
 
     # L2: L1_y ~ L3_y 중간에 가장 가까운 라인
@@ -266,7 +259,6 @@ def select_L2_L3(
     candidates = sorted_lines[:-1]
     L2 = min(candidates, key=lambda l: abs(float(l.mean()) - mid_target))
 
-    print(f"[Lines] L1_y={L1_y}, L2 y≈{int(L2.mean())}, L3 y≈{int(L3_y)}")
     return L2, L3
 
 
@@ -296,8 +288,6 @@ def check_fat_layer(
     b3 = zone_mean(L2, L3)
     diff = abs(b2 - b3)
     has_fat = diff >= bright_diff_thr
-    print(f"[Fat] zone2(L1~L2)={b2:.1f}, zone3(L2~L3)={b3:.1f}, "
-          f"diff={diff:.1f} → fat={'YES' if has_fat else 'NO'}")
     return has_fat
 
 
@@ -400,31 +390,31 @@ def _detect_smas_thick_stripe(
 
     # SMAS zone 자체가 없는 경우
     if L2_y <= L1_y:
-        print(f"[ThickStripe] 실패 - SMAS zone 없음 (L1_y={L1_y} >= L2_y={L2_y})")
         return np.zeros((h, w), dtype=bool)
 
-    best_sum = -1.0
-    best_y = -1
-    n_filtered = 0
+    # 모든 후보 y_center 벡터 생성
+    y_centers = np.arange(L1_y, L2_y + 1, dtype=np.int32)
+    y_tops = np.maximum(0,     y_centers - half_win)
+    y_bots = np.minimum(h - 1, y_centers + half_win)
 
-    for y_center in range(L2_y, L1_y - 1, -1):
-        y_top = max(0, y_center - half_win)
-        y_bot = min(h - 1, y_center + half_win)
+    # l1_margin 필터
+    valid = y_tops > L1_y + l1_margin
 
-        if y_top <= L1_y + l1_margin:
-            n_filtered += 1
-            continue
-
-        win_sum = float(enh_f[y_top:y_bot + 1, :].sum())
-        if win_sum > best_sum:
-            best_sum = win_sum
-            best_y = y_center
-
-    if best_y < 0:
-        print(f"[ThickStripe] 실패 - 유효 window 없음 "
-              f"(L1_y={L1_y}, L2_y={L2_y}, l1_margin={l1_margin}, "
-              f"필터된 window={n_filtered}개 → SMAS zone이 너무 얇음)")
+    if not valid.any():
         return np.zeros((h, w), dtype=bool)
+
+    y_centers = y_centers[valid]
+    y_tops    = y_tops[valid]
+    y_bots    = y_bots[valid]
+
+    # 행별 합 cumsum으로 sliding window 합 O(h*w) → O(h+w)
+    row_sums = enh_f.sum(axis=1)                          # (h,)
+    cumsum   = np.concatenate([[0.0], np.cumsum(row_sums)])  # (h+1,)
+    win_sums = cumsum[y_bots + 1] - cumsum[y_tops]        # (n_valid,)
+
+    best_idx = int(np.argmax(win_sums))
+    best_y   = int(y_centers[best_idx])
+    best_sum = float(win_sums[best_idx])
 
     y_top = max(0, best_y - half_win)
     y_bot = min(h - 1, best_y + half_win)
@@ -443,14 +433,6 @@ def _detect_smas_thick_stripe(
     ker_v = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     result = cv2.morphologyEx(result.astype(np.uint8), cv2.MORPH_CLOSE, ker_v).astype(bool)
 
-    if not result.any():
-        print(f"[ThickStripe] 실패 - threshold 초과 픽셀 없음 "
-              f"(best_y={best_y}, thr={thr:.1f}, "
-              f"window mean={win_patch.mean():.1f}, std={win_patch.std():.1f})")
-        return result
-
-    print(f"[ThickStripe] 성공 - best_y={best_y}, brightness_sum={best_sum:.0f}, "
-          f"win=[{y_top},{y_bot}], area={result.sum()}")
     return result
 
 
@@ -485,7 +467,6 @@ def build_layer_masks(
         L1 = np.full(w, h // 3, dtype=np.int32)
         L2 = np.full(w, h * 2 // 3, dtype=np.int32)
         L3 = np.full(w, h - 1, dtype=np.int32)
-        print("[Build] 라인 부족 — 이미지 3등분 fallback 적용")
     else:
         L1, L2, L3 = key_lines[0], key_lines[1], key_lines[2]
 
@@ -568,7 +549,6 @@ def render_overlay(image_bgr: np.ndarray,
     """층 마스크를 컬러 반투명 overlay 로 합성."""
     out = image_bgr.astype(np.float32)
 
-    # 기본 4개 층 — 반투명 (alpha)
     for name in ["epidermis", "smas", "fat", "bone"]:
         if name not in layer_masks:
             continue
@@ -578,13 +558,11 @@ def render_overlay(image_bgr: np.ndarray,
         color = np.array(COLORS[name], dtype=np.float32)
         out[mask] = (1.0 - alpha) * out[mask] + alpha * color
 
-    # SMAS 내 밝은 줄기 — 별도 alpha 로 덧그림
     if "smas_bright" in layer_masks and np.any(layer_masks["smas_bright"]):
         mask = layer_masks["smas_bright"]
         color = np.array(COLORS["smas_bright"], dtype=np.float32)
         out[mask] = (1.0 - smas_bright_alpha) * out[mask] + smas_bright_alpha * color
 
-    # SMAS 내 가장 굵은 줄기 — 초록, 가장 진하게 맨 위에 덧그림
     if "smas_thick" in layer_masks and np.any(layer_masks["smas_thick"]):
         mask = layer_masks["smas_thick"]
         color = np.array(COLORS["smas_thick"], dtype=np.float32)

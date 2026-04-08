@@ -8,18 +8,28 @@ LoRA 체크포인트를 적용한 MedSAM2로 초음파 영상에서 SMAS 층 자
   Frame 1~N : SAM2 video memory propagation (LoRA backbone 계속 적용)
               → frame 0의 mask가 memory에 저장되어 공간 정보로 활용
 
+디렉토리 구조:
+  beauty/
+    analog/
+      analog_result_24_v1/
+        output1/  ← frames_root/video_name
+          frame_00001.png
+          frame_00002.png
+          ...
+        output2/
+          ...
+
 사용법:
     python infer_lora.py --video_name output1
-
+    ../analog/analog_result_24_v1  폴더 안에 있는 output1 안에 있는 frame을 돌면서 finetuning된 medsam을 적용한다.
     # 여러 폴더 한번에
     python infer_lora.py --video_name output1 output2 output3
 
     # 경로 직접 지정
     python infer_lora.py \\
         --video_name output1 \\
-        --frames_root result_resolution \\
-        --lora_ckpt lora_checkpoints/best_lora.pt \\
-        --output_root lora_masks
+        --frames_root ../analog/analog_result_24_v1 \\
+        --output_root output_lora/lora_masks
 """
 
 import argparse
@@ -32,13 +42,20 @@ import cv2
 from pathlib import Path
 from PIL import Image
 
-sys.path.insert(0, str(Path(__file__).parent / "MedSAM2"))
+# ── 경로 설정 ──────────────────────────────────────────────────────────────────
+_HERE    = Path(__file__).resolve().parent      # medsam_finetune_lora/
+_ROOT    = _HERE.parent                         # beauty/
+_MEDSAM2 = _ROOT / "MedSAM2"
+
+sys.path.insert(0, str(_MEDSAM2))
 
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 
-SAM2_CFG  = "configs/sam2.1_hiera_t512.yaml"
-SAM2_CKPT = "./MedSAM2/checkpoints/MedSAM2_US_Heart.pt"
-LORA_CKPT = " train_lora_unimatch_using42_propagated/best_lora_unimatch.pt"
+SAM2_CFG    = "configs/sam2.1_hiera_t512.yaml"
+SAM2_CKPT   = str(_MEDSAM2 / "checkpoints" / "MedSAM2_US_Heart.pt")
+LORA_CKPT   = str(_HERE / "model_checkpoints/train_lora_unimatch_aug_usingall/best_lora_unimatch.pt")
+FRAMES_ROOT = str(_ROOT / "analog" / "analog_result_24_v1")
+OUTPUT_ROOT = str(_HERE / "output_lora" / "train_lora_unimatch_aug_usingall")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -281,11 +298,11 @@ def main():
     parser = argparse.ArgumentParser(description="MedSAM2 LoRA SMAS 추론")
     parser.add_argument("--video_name",   nargs="+", required=True,
                         help="처리할 영상 폴더명 (예: output1 output2)")
-    parser.add_argument("--frames_root",  default="result_resolution",
-                        help="프레임 루트 (기본값: result_resolution)")
+    parser.add_argument("--frames_root",  default=FRAMES_ROOT,
+                        help="프레임 루트 (기본값: beauty/analog/analog_result_24_v1)")
     parser.add_argument("--lora_ckpt",    default=LORA_CKPT,
                         help="LoRA 체크포인트 경로")
-    parser.add_argument("--output_root",  default="lora_masks",
+    parser.add_argument("--output_root",  default=OUTPUT_ROOT,
                         help="마스크 출력 루트 폴더")
     parser.add_argument("--n_prompt_tokens", type=int, default=2,
                         help="학습 때와 동일한 프롬프트 토큰 수")

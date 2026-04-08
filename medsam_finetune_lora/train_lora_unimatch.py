@@ -49,22 +49,30 @@ from torchvision import transforms
 from PIL import Image
 from scipy.ndimage import distance_transform_edt
 
-sys.path.insert(0, str(Path(__file__).parent / "MedSAM2"))
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # 0. 경로 설정
 # ──────────────────────────────────────────────────────────────────────────────
 
-LABELED_OUTPUTS  = ["output1", "output10", "output20", "output30","output42"]
-ANN_ROOT         = "propagated_masks"
-FRAMES_ROOT      = "result_resolution"
-OUTPUT_DIR       = "../ train_lora_unimatch_using42_propagated_US_train_decoder"
-MEDSAM2_DIR      = "../MedSAM2"
-SAM2_CFG         = "configs/sam2.1_hiera_t512.yaml"
-SAM2_CKPT        = "./MedSAM2/checkpoints/MedSAM2_US_Heart.pt"
-CONF_THRESH      = 0.95
-EMA_DECAY        = 0.996
+_HERE = Path(__file__).resolve().parent      # medsam_finetune_lora/
+_ROOT = _HERE.parent                          # beauty/
+
+sys.path.insert(0, str(_ROOT / "MedSAM2"))
+sys.path.insert(0, str(_HERE))
+
+# annotation: labeling_data/annotation/output{N}/frame_XXXXX.png
+# frames    : analog/analog_result_24_v1/output{N}/frames/frame_XXXXX.png
+# output1, output10 → validation 전용 (같은 영상 내 프레임 leakage 방지)
+# output20, output30, output42, output44 → 학습 전용
+TRAIN_OUTPUTS   = ["output20", "output30", "output42", "output44"]
+VAL_OUTPUTS     = ["output1", "output10"]
+ANN_ROOT        = str(_ROOT / "labeling_data" / "propagated_masks")
+FRAMES_ROOT     = str(_ROOT / "analog" / "analog_result_24_v1")
+OUTPUT_DIR      = str(_HERE / "model_checkpoints" / "train_lora_unimatch_aug_usingall")
+MEDSAM2_DIR     = str(_ROOT / "MedSAM2")
+SAM2_CFG        = "configs/sam2.1_hiera_t512.yaml"
+SAM2_CKPT       = str(_ROOT / "MedSAM2" / "checkpoints" / "MedSAM2_US_Heart.pt")
+CONF_THRESH     = 0.95
+EMA_DECAY       = 0.996
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -95,6 +103,47 @@ def _load_mask(path: str, img_size: int) -> torch.Tensor:
     t   = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
     t   = F.interpolate(t, size=(img_size, img_size), mode="nearest").squeeze(0)
     return t
+
+
+def _load_gray_arr(path: str, clip_pct: float = 0.5) -> np.ndarray:
+    """grayscale PNG → 정규화된 float32 numpy [H, W]. 크기 조정 전 단계."""
+    arr = np.array(Image.open(path).convert("L"), dtype=np.float32)
+    lo  = np.percentile(arr, clip_pct)
+    hi  = np.percentile(arr, 100 - clip_pct)
+    arr = np.clip(arr, lo, hi)
+    return (arr - lo) / (hi - lo + 1e-6)
+
+
+def _arr_to_tensor(arr: np.ndarray, img_size: int) -> torch.Tensor:
+    """[H, W] float32 → normalize → [3, img_size, img_size]."""
+    t    = torch.from_numpy(arr).unsqueeze(0).repeat(3, 1, 1)
+    t    = F.interpolate(t.unsqueeze(0), size=(img_size, img_size),
+                         mode="bilinear", align_corners=False).squeeze(0)
+    norm = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
+    return norm(t)
+
+
+def _mask_arr_to_tensor(arr: np.ndarray, img_size: int) -> torch.Tensor:
+    """[H, W] binary float32 → [1, img_size, img_size]."""
+    t = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
+    return F.interpolate(t, size=(img_size, img_size), mode="nearest").squeeze(0)
+
+
+def _random_crop(h: int, w: int,
+                 ratio_min: float = 0.6,
+                 ratio_max: float = 1.0) -> tuple[int, int, int, int]:
+    """
+    [H, W] 이미지에서 랜덤 crop 좌표 (y1, y2, x1, x2) 반환.
+    ratio_min ~ ratio_max 비율로 높이/너비를 독립적으로 샘플링.
+    frame과 mask에 동일하게 적용해 공간 일관성 유지.
+    """
+    crop_h = int(h * random.uniform(ratio_min, ratio_max))
+    crop_w = int(w * random.uniform(ratio_min, ratio_max))
+    crop_h = max(crop_h, 32)   # 너무 작은 crop 방지
+    crop_w = max(crop_w, 32)
+    y1 = random.randint(0, h - crop_h)
+    x1 = random.randint(0, w - crop_w)
+    return y1, y1 + crop_h, x1, x1 + crop_w
 
 
 # ── CutMix ──────────────────────────────────────────────────────────────────
@@ -153,8 +202,9 @@ class SMASLabeledDataset(Dataset):
     """
 
     def __init__(self, ann_root: str, frames_root: str,
-                 labeled_outputs: list, img_size: int = 512):
+                 labeled_outputs: list, img_size: int = 512, augment: bool = True):
         self.img_size = img_size
+        self.augment  = augment   # False이면 augmentation 없이 원본만 반환 (val용)
         self.pairs = []  # (frame_path, mask_path)
 
         for output_name in labeled_outputs:
@@ -170,20 +220,41 @@ class SMASLabeledDataset(Dataset):
 
         if not self.pairs:
             raise RuntimeError(f"labeled 데이터 없음. ann_root={ann_root} 확인 필요")
-        print(f"[Labeled]  {len(self.pairs)}개 (annotation 기준 GT)")
+        mode = "train+aug" if augment else "val (no aug)"
+        print(f"[Labeled/{mode}]  {len(self.pairs)}개  outputs={labeled_outputs}")
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, idx):
         frame_path, mask_path = self.pairs[idx]
-        img  = _load_gray(frame_path, self.img_size)
-        mask = _load_mask(mask_path, self.img_size)
 
-        # weak augmentation (horizontal flip only)
-        if random.random() < 0.5:
-            img  = torch.flip(img,  dims=[-1])
-            mask = torch.flip(mask, dims=[-1])
+        # 원본 크기로 numpy 로드 (crop 적용 전)
+        frame_arr = _load_gray_arr(frame_path)
+        mask_arr  = (np.array(Image.open(mask_path).convert("L")) > 127).astype(np.float32)
+
+        h, w = frame_arr.shape
+
+        if self.augment:
+            # ── Random Crop (frame + mask 동일 영역) ──────────────────────────
+            if random.random() < 0.8:
+                y1, y2, x1, x2 = _random_crop(h, w, ratio_min=0.6, ratio_max=1.0)
+                frame_arr = frame_arr[y1:y2, x1:x2]
+                mask_arr  = mask_arr[y1:y2,  x1:x2]
+
+        # numpy → tensor (img_size로 resize + normalize)
+        img  = _arr_to_tensor(frame_arr, self.img_size)
+        mask = _mask_arr_to_tensor(mask_arr, self.img_size)
+
+        if self.augment:
+            # ── Horizontal Flip ───────────────────────────────────────────────
+            if random.random() < 0.5:
+                img  = torch.flip(img,  dims=[-1])
+                mask = torch.flip(mask, dims=[-1])
+
+            # ── Brightness / Contrast Jitter ──────────────────────────────────
+            if random.random() < 0.6:
+                img = img * random.uniform(0.7, 1.3) + random.uniform(-0.1, 0.1)
 
         return img, mask
 
@@ -394,7 +465,7 @@ def load_ckpt(model: nn.Module, path: str):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def train_epoch(student, teacher, labeled_loader, unlabeled_loader,
-                optimizer, criterion, device, global_step, scaler):
+                optimizer, criterion, device, global_step, scaler, epoch=0):
     student.train()
     teacher.eval()
 
@@ -404,7 +475,7 @@ def train_epoch(student, teacher, labeled_loader, unlabeled_loader,
     labeled_iter   = iter(labeled_loader)
     unlabeled_iter = iter(unlabeled_loader)
 
-    for _ in range(n_batches):
+    for batch_idx in range(n_batches):
         # ── 데이터 로드 ──
         img_x, mask_x = next(labeled_iter)
         img_u_w, img_u_s1, img_u_s2, box1, box2 = next(unlabeled_iter)
@@ -430,6 +501,15 @@ def train_epoch(student, teacher, labeled_loader, unlabeled_loader,
                 pred_u_w   = forward_single(teacher, img_u_w)   # [B, 1, H, W]
                 conf_u_w   = torch.sigmoid(pred_u_w)            # confidence
                 pseudo_u_w = (conf_u_w > CONF_THRESH).float()   # pseudo-label
+
+            # conf 통과 픽셀 모니터링
+            valid_px = pseudo_u_w.sum().item()
+            total_px = pseudo_u_w.numel()
+            avg_conf = conf_u_w.mean().item()
+            print(f"  [E{epoch} B{batch_idx+1}/{n_batches}] "
+                  f"conf_avg={avg_conf:.4f} | "
+                  f"threshold({CONF_THRESH}) 통과: {int(valid_px)}/{total_px} "
+                  f"({100*valid_px/total_px:.2f}%)")
 
             # ── CutMix 적용 ──
             img_u_s1, pseudo_s1, conf_s1 = _apply_cutmix(
@@ -530,8 +610,8 @@ def main():
         sys.path.insert(0, medsam2_path)
 
     from sam2.build_sam import build_sam2
-    from medsam_finetune_lora.lora_medsam2 import (apply_lora_to_model, add_default_prompt,
-                                                   get_trainable_params)
+    from lora_medsam2 import (apply_lora_to_model, add_default_prompt,
+                               get_trainable_params)
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -562,15 +642,28 @@ def main():
     print("[Train] EMA teacher 초기화 완료")
 
     # ── 데이터셋 ──
-    labeled_ds = SMASLabeledDataset(
+    # output1, output10 → val 전용 (영상 내 연속 프레임 leakage 방지)
+    # output20, output30, output42, output44 → train 전용
+    train_labeled = SMASLabeledDataset(
         ann_root=args.ann_root,
         frames_root=args.frames_root,
-        labeled_outputs=LABELED_OUTPUTS,
+        labeled_outputs=TRAIN_OUTPUTS,
         img_size=args.img_size,
+        augment=True,
+    )
+    val_labeled = SMASLabeledDataset(
+        ann_root=args.ann_root,
+        frames_root=args.frames_root,
+        labeled_outputs=VAL_OUTPUTS,
+        img_size=args.img_size,
+        augment=False,   # val은 augmentation 없이 원본 그대로 평가
     )
 
-    # labeled 프레임 경로 집합 (unlabeled에서 제외)
-    labeled_paths = {p for p, _ in labeled_ds.pairs}
+    # labeled 전체 경로 집합 (unlabeled에서 제외)
+    labeled_paths = (
+        {p for p, _ in train_labeled.pairs} |
+        {p for p, _ in val_labeled.pairs}
+    )
 
     unlabeled_ds = SMASUnlabeledDataset(
         frames_root=args.frames_root,
@@ -578,14 +671,7 @@ def main():
         img_size=args.img_size,
     )
 
-    # labeled → train/val 분할
-    n_val   = max(1, int(len(labeled_ds) * args.val_ratio))
-    n_train = len(labeled_ds) - n_val
-    train_labeled, val_labeled = torch.utils.data.random_split(
-        labeled_ds, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42))
-
-    print(f"[Train] labeled train={n_train}, val={n_val}, "
+    print(f"[Train] train={len(train_labeled)}, val={len(val_labeled)}, "
           f"unlabeled={len(unlabeled_ds)}")
 
     pw = args.num_workers > 0
@@ -639,7 +725,7 @@ def main():
 
         total_l, sup_l, unsup_l, global_step = train_epoch(
             student, teacher, labeled_loader, unlabeled_loader,
-            optimizer, criterion, device, global_step, scaler)
+            optimizer, criterion, device, global_step, scaler, epoch=epoch)
 
         lr_scheduler.step()
         metrics = validate(student, val_loader, device, criterion)
