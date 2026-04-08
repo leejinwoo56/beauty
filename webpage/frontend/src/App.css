@@ -1,0 +1,247 @@
+/* ── 레이아웃 ──────────────────────────────────────────────────────────────── */
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 40px 24px;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+}
+
+.app-header {
+  text-align: center;
+}
+
+.app-header h1 {
+  font-size: 2.2rem;
+  font-weight: 700;
+  margin-bottom: 8px;
+  background: linear-gradient(135deg, #4f8ef7, #a78bfa);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.app-header p {
+  color: var(--text);
+  font-size: 1rem;
+}
+
+.app-main {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+}
+
+/* ── 업로드 섹션 ───────────────────────────────────────────────────────────── */
+.upload-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.upload-zone {
+  width: 100%;
+  max-width: 560px;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 48px 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  background: var(--surface);
+}
+
+.upload-zone:hover:not(.disabled) {
+  border-color: var(--accent);
+  background: rgba(79, 142, 247, 0.06);
+}
+
+.upload-zone.dragging {
+  border-color: var(--accent);
+  background: rgba(79, 142, 247, 0.1);
+}
+
+.upload-zone.disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.upload-icon {
+  font-size: 2.5rem;
+  display: block;
+  margin-bottom: 12px;
+}
+
+.upload-zone p {
+  color: var(--text-h);
+  font-size: 1rem;
+  margin-bottom: 6px;
+}
+
+.upload-sub {
+  color: var(--text) !important;
+  font-size: 0.85rem !important;
+}
+
+/* 선택된 파일 정보 */
+.file-info {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 0.9rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 16px;
+}
+
+.file-size {
+  color: var(--text);
+}
+
+/* 분석 시작 버튼 */
+.btn-start {
+  background: var(--accent);
+  color: #fff;
+  font-size: 1rem;
+  font-weight: 600;
+  padding: 12px 40px;
+  border-radius: var(--radius);
+  min-width: 160px;
+}
+
+.btn-start:hover:not(:disabled) {
+  background: var(--accent-h);
+}
+
+/* ── 상태 섹션 ────────────────────────────────────────────────────────────── */
+.status-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.status-badge {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 24px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-size: 1rem;
+}
+
+.status-badge.done {
+  border-color: var(--green);
+}
+
+.status-badge.error {
+  border-color: var(--red);
+}
+
+.status-icon {
+  font-size: 1.4rem;
+}
+
+/* 스피너 */
+.spinner {
+  width: 22px;
+  height: 22px;
+  border: 3px solid rgba(79, 142, 247, 0.2);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 다시 시작 버튼 */
+.btn-reset {
+  background: var(--surface);
+  color: var(--text-h);
+  border: 1px solid var(--border);
+  padding: 10px 28px;
+}
+
+.btn-reset:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ── 결과 패널 ────────────────────────────────────────────────────────────── */
+.video-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.video-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+
+@media (max-width: 768px) {
+  .video-pair {
+    grid-template-columns: 1fr;
+  }
+}
+
+.video-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.video-box h3 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+  text-align: center;
+}
+
+.video-box video {
+  width: 100%;
+  border-radius: 8px;
+  background: #000;
+}
+
+.video-placeholder {
+  aspect-ratio: 16/9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.3);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.result-actions {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+}
+
+.btn-download {
+  background: var(--green);
+  color: #fff;
+  font-weight: 600;
+  padding: 12px 32px;
+}
+
+.btn-download:hover:not(:disabled) {
+  background: #16a34a;
+}

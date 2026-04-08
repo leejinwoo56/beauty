@@ -1,0 +1,12 @@
+# FastAPI 서버
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6   # 파일 업로드 지원
+
+# 영상/이미지 처리 (이미 설치되어 있을 가능성 높음)
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# AI (이미 설치되어 있을 가능성 높음 — 재설치 시 오래 걸림)
+# torch>=2.0.0            # 이미 설치된 경우 주석 유지
