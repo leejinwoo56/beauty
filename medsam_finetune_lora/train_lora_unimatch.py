@@ -63,11 +63,12 @@ sys.path.insert(0, str(_HERE))
 # frames    : analog/analog_result_24_v1/output{N}/frames/frame_XXXXX.png
 # output1, output10 → validation 전용 (같은 영상 내 프레임 leakage 방지)
 # output20, output30, output42, output44 → 학습 전용
-TRAIN_OUTPUTS   = ["output20", "output30", "output42", "output44"]
-VAL_OUTPUTS     = ["output1", "output10"]
+TRAIN_OUTPUTS    = ["output20", "output30","output42","output44"]
+VAL_OUTPUTS      = ["output1","output10"]
+EXCLUDE_OUTPUTS  = ["output50", "output53"]   # 학습/검증 모두에서 제외할 output 목록. 예: ["output47"]
 ANN_ROOT        = str(_ROOT / "labeling_data" / "propagated_masks")
 FRAMES_ROOT     = str(_ROOT / "analog" / "analog_result_24_v1")
-OUTPUT_DIR      = str(_HERE / "model_checkpoints" / "train_lora_unimatch_aug_usingall")
+OUTPUT_DIR      = str(_HERE / "model_checkpoints" / "train_lora_unimatch_aug_exclude5053")
 MEDSAM2_DIR     = str(_ROOT / "MedSAM2")
 SAM2_CFG        = "configs/sam2.1_hiera_t512.yaml"
 SAM2_CKPT       = str(_ROOT / "MedSAM2" / "checkpoints" / "MedSAM2_US_Heart.pt")
@@ -644,17 +645,22 @@ def main():
     # ── 데이터셋 ──
     # output1, output10 → val 전용 (영상 내 연속 프레임 leakage 방지)
     # output20, output30, output42, output44 → train 전용
+    train_outputs = [o for o in TRAIN_OUTPUTS if o not in EXCLUDE_OUTPUTS]
+    val_outputs   = [o for o in VAL_OUTPUTS   if o not in EXCLUDE_OUTPUTS]
+    if EXCLUDE_OUTPUTS:
+        print(f"[EXCLUDE] 제외된 outputs: {EXCLUDE_OUTPUTS}")
+
     train_labeled = SMASLabeledDataset(
         ann_root=args.ann_root,
         frames_root=args.frames_root,
-        labeled_outputs=TRAIN_OUTPUTS,
+        labeled_outputs=train_outputs,
         img_size=args.img_size,
         augment=True,
     )
     val_labeled = SMASLabeledDataset(
         ann_root=args.ann_root,
         frames_root=args.frames_root,
-        labeled_outputs=VAL_OUTPUTS,
+        labeled_outputs=val_outputs,
         img_size=args.img_size,
         augment=False,   # val은 augmentation 없이 원본 그대로 평가
     )
