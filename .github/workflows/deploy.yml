@@ -1,0 +1,38 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'webpage/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_KEY }}
+          script: |
+            # 1. 최신 코드 pull
+            cd ~/beauty
+            git pull origin main
+
+            # 2. React 빌드
+            cd ~/beauty/webpage/frontend
+            npm install
+            npm run build
+            sudo cp -r dist/* /var/www/html/
+
+            # 3. FastAPI 재시작
+            sudo systemctl restart beauty
+
+            echo "✅ 배포 완료"

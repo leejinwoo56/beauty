@@ -39,7 +39,7 @@ _OUTPUT_DIR = _HERE / "analog_result_24_v1"            # beauty/analog/analog_re
 LAYER_ALPHA       = 0.23
 SMAS_BRIGHT_ALPHA = 0.25
 SMAS_THICK_ALPHA  = 0.69
-DEFAULT_ROI       = (50, 70, 1100, 700)
+DEFAULT_ROI       = (133, 70, 1015, 700)
 
 
 # ── 프레임 단위 처리 ───────────────────────────────────────────────────────────
@@ -156,14 +156,31 @@ def process_one(n: int):
     print(f"  frames/: {idx}개  masks/: {idx}개  vis/: {idx}개  영상: {video_path.name}")
 
 
+def parse_num_list(tokens: list[str]) -> list[int]:
+    """
+    "55-57" → [55, 56, 57]
+    "1"     → [1]
+    혼합 가능: --num 1 2 55-57 → [1, 2, 55, 56, 57]
+    """
+    nums = []
+    for token in tokens:
+        if "-" in token:
+            start, end = token.split("-", 1)
+            nums.extend(range(int(start), int(end) + 1))
+        else:
+            nums.append(int(token))
+    return nums
+
+
 def main():
     parser = argparse.ArgumentParser(description="analog 탐지 영상 처리")
-    parser.add_argument("--num", required=True, type=int, nargs="+",
-                        help="처리할 영상 번호 (여러 개 가능: --num 1 2 3)")
+    parser.add_argument("--num", required=True, type=str, nargs="+",
+                        help="처리할 영상 번호. 개별: --num 1 2 3 / 범위: --num 55-57 / 혼합: --num 1 55-57")
     args = parser.parse_args()
 
-    total = len(args.num)
-    for i, n in enumerate(args.num, 1):
+    nums = parse_num_list(args.num)
+    total = len(nums)
+    for i, n in enumerate(nums, 1):
         print(f"\n[{i}/{total}] Image{n} 처리 중...")
         process_one(n)
 

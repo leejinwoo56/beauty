@@ -198,24 +198,36 @@ def predict_frame0(model, img_path: str, device: torch.device) -> np.ndarray:
 def extract_frames(video_path: str, frames_dir: str):
     """
     mp4 등 영상을 PNG 프레임 시퀀스로 분해.
-    SAM2 video predictor는 폴더 내 PNG 파일을 순서대로 읽는 방식 사용.
+    ffmpeg를 사용해 프레임 추출 (EC2 등 OpenCV 코덱 미지원 환경 대응).
     Returns: (총 프레임 수, fps, width, height)
     """
-    cap = cv2.VideoCapture(video_path)
-    fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
     os.makedirs(frames_dir, exist_ok=True)
-    idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        cv2.imwrite(str(Path(frames_dir) / f"frame_{idx+1:05d}.png"), frame)
-        idx += 1
-    cap.release()
-    return idx, fps, width, height
+
+    # ffmpeg로 fps/해상도 추출
+    probe_cmd = [
+        "/usr/bin/ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate",
+        "-of", "csv=p=0",
+        video_path
+    ]
+    result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+    parts = result.stdout.strip().split(",")
+    width, height = int(parts[0]), int(parts[1])
+    num, den = parts[2].split("/")
+    fps = float(num) / float(den)
+
+    # ffmpeg로 프레임 추출
+    cmd = [
+        "/usr/bin/ffmpeg", "-y", "-i", video_path,
+        str(Path(frames_dir) / "frame_%05d.png")
+    ]
+    result2 = subprocess.run(cmd, capture_output=True, text=True)
+    if result2.returncode != 0:
+        raise RuntimeError(f"ffmpeg frame extraction failed:\n{result2.stderr}")
+
+    frames = sorted(Path(frames_dir).glob("frame_*.png"))
+    return len(frames), fps, width, height
 
 
 # ── 추론 + 오버레이 영상 생성 ──────────────────────────────────────────────────
@@ -308,7 +320,7 @@ def _reencode_to_h264(video_path: str):
     """
     tmp_path = video_path.replace(".mp4", "_tmp.mp4")
     cmd = [
-        "ffmpeg", "-y",           # -y: 덮어쓰기 확인 없이 진행
+        "/usr/bin/ffmpeg", "-y",           # -y: 덮어쓰기 확인 없이 진행
         "-i", video_path,         # 입력: mp4v 파일
         "-vcodec", "libx264",     # 출력 코덱: H.264
         "-crf", "23",             # 화질 (낮을수록 고화질, 18~28 권장)
