@@ -1,0 +1,129 @@
+================================================================
+SMAS 층 탐지를 위한 MedSAM2 Finetuning - 논문 기반 방법론 정리
+================================================================
+최종 업데이트: 2026-03-31
+
+----------------------------------------------------------------
+1. SAM (Segment Anything, 2023)
+----------------------------------------------------------------
+[적용 가능 요소]
+- box prompt를 이미지 전체 영역으로 설정하고 SMAS 층만 학습하도록 finetuning
+  → 이미지/프롬프트 인코더는 freeze, 마스크 디코더 가중치만 업데이트
+- Loss: Focal Loss + Dice Loss (20:1 비율)
+  * Focal Loss: 픽셀 단위로 어려운 부분에만 집중 (배경 loss 억제)
+  * Dice Loss: 전체 형태/면적 기반 loss (크기에 무관)
+- LSJ 증강: ground truth mask도 함께 확대/축소 → overfitting 방지
+
+[주의사항]
+- SMAS 층은 전체 이미지의 10% 이하로 극단적 클래스 불균형 존재
+  → Focal Loss의 gamma 값 조정 필요
+
+----------------------------------------------------------------
+2. SAMed (2023) - 핵심 참조 논문
+----------------------------------------------------------------
+[적용 가능 요소]
+A. LoRA Finetuning
+   - 이미지 인코더의 Q, V 행렬에만 LoRA bypass 적용 (K, output에는 적용 X)
+   - ablation 결과: Q+V에만 적용했을 때 성능 최고, 전체 레이어에 적용 시 오히려 저하
+   - rank r을 작게 설정해서 학습 파라미터 수 최소화
+
+B. 프롬프트 없는 자동 탐지
+   - default prompt embedding을 학습 가능하게 열어두고 finetuning
+   - 초음파 이미지 입력 시 자동으로 SMAS 층 탐지 (user prompt 불필요)
+
+C. Loss 함수
+   - BCE + Dice Loss 사용 (이진 분류이므로 CE 대신 BCE)
+   - SAM의 Focal Loss(20배) 대신 BCE 사용: 데이터가 적으므로 초기엔 BCE+Dice가 안정적
+
+D. 학습 전략
+   - Warmup + AdamW optimizer 사용
+   - 데이터 부족 + 초음파 노이즈로 loss가 불안정할 수 있으므로 Warmup 필수
+   - SGD와 비교 실험 권장
+
+----------------------------------------------------------------
+3. MedSAM (2024)
+----------------------------------------------------------------
+[적용 가능 요소]
+A. 모델 구조
+   - ViT-H → ViT-Base로 변경 (의료 영상에서 성능 차이 미미, 속도 대폭 향상)
+
+B. Loss 함수
+   - BCE + Dice Loss (1:1 비율) 사용
+   - Focal Loss 미사용 이유: bounding box prompt 사용 시 극단적 클래스 불균형 없음
+   - 초기엔 BCE+Dice(1:1) → 이후 Focal Loss 점진적 도입 (가중치 5~10배로 조정)
+
+C. 입력 전처리
+   - 이미지 밝기 상하위 0.5% clipping → 튀는 밝기값 제거
+   - 흑백 채널을 3번 복사 → RGB 형태 텐서로 변환 후 SAM encoder 입력
+
+D. 가상 Box Prompt
+   - analog 방식으로 SMAS 층 대략적 위치 추정 후 box prompt로 제공
+   - 기존 파이프라인(analog detection)과 연동 가능한 핵심 전략
+
+E. 데이터 증강
+   - 데이터가 충분하면 증강 불필요하나, 200장 수준에서는 증강 권장
+
+----------------------------------------------------------------
+4. FixMatch (2020) - Semi-supervised Learning
+----------------------------------------------------------------
+[적용 가능 요소 - 데이터 확장 전략]
+A. 픽셀 단위 Pseudo Labeling
+   - SMAS층일 확률이 높거나 배경일 확률이 높은 픽셀만 pseudo label 확정
+   - 애매한 확률(중간값) 픽셀은 masking해서 학습 제외
+
+B. 비대칭 임계값
+   - 전체 이미지의 10% 이하인 SMAS 층 → 배경과 동일 임계값 적용 시 배경에 편향
+   - SMAS 층에는 낮은 임계값, 배경에는 높은 임계값 (비대칭 설정)
+
+C. 증강 페어링
+   - 기하학적 증강 시 약한 증강의 pseudo label에도 동일 변환 적용 (픽셀 위치 일치)
+   - 강한 증강: 밝기 조절, 가우시안 노이즈, Cutout, CutMix 활용
+
+D. Unlabeled 데이터 활용
+   - 기존 200장 외 라벨 없는 초음파 영상에서 추가 학습 가능
+   - unlabeled loss에 Dice Loss 추가 고려
+
+----------------------------------------------------------------
+5. LoRA (Low-Rank Adaptation) - 공통 기반 기술
+----------------------------------------------------------------
+[원리]
+- 기존 가중치 W는 freeze, 작은 행렬 A(d×r), B(r×d)만 학습
+- 초기: A는 random init, B는 0 → 학습 초기에 원본 모델에 영향 없음
+- 최종: W_new = W + BA
+
+[MedSAM2 적용 시]
+- 이미지 인코더(무거움)의 Attention Q, V에 LoRA 적용
+- rank r 권장: 4~16 (데이터 200장 수준에서는 낮은 r이 안전)
+
+================================================================
+추천 Finetuning 전략 (종합)
+================================================================
+
+[Phase 1: Baseline (SAMed 방식)]
+- LoRA (Q, V only, r=4~8) + 프롬프트 인코더 default embedding 학습
+- Loss: BCE + Dice (1:1)
+- Optimizer: AdamW + Warmup
+- 입력: MedSAM 전처리 (clipping + 3ch 복사)
+
+[Phase 2: Box Prompt 연동]
+- analog 방식으로 추정한 SMAS 위치를 box prompt로 입력
+- 가상 prompt로 성능 향상 확인
+
+[Phase 3: 데이터 확장 (선택)]
+- FixMatch 기반 semi-supervised: 라벨 없는 초음파 영상 활용
+- 비대칭 임계값 설정
+
+[비교 실험 모델 목록]
+1. MedSAM2 + LoRA (Q+V, r=4)
+2. MedSAM2 + LoRA (Q+V, r=8)
+3. MedSAM2 + Full finetuning (decoder only)
+4. MedSAM2 + LoRA + Box Prompt (analog 연동)
+5. MedSAM2 + LoRA + Semi-supervised (FixMatch)
+
+[평가 지표]
+- Dice Score (주지표)
+- IoU (Jaccard Index)
+- Hausdorff Distance (경계선 정확도)
+- Precision / Recall
+
+================================================================
