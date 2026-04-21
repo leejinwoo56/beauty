@@ -1,0 +1,123 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# docker-compose.yml — Sandbox V2
+#
+# 실행 방법 (beauty/ 루트에서):
+#   docker compose -f sandbox_v2/docker-compose.yml up -d --build
+#
+# 종료:
+#   docker compose -f sandbox_v2/docker-compose.yml down
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+services:
+
+  # ── JupyterLab 컨테이너 ──────────────────────────────────────────────────────
+  jupyter:
+    build:
+      # 빌드 컨텍스트를 beauty/ 루트로 설정
+      # → Dockerfile 안의 COPY MedSAM2/, COPY medsam_finetune_lora/ 가 동작함
+      context: ..
+      dockerfile: sandbox_v2/Dockerfile
+    container_name: sandbox-jupyter
+
+    environment:
+      # .env 파일에서 토큰 값을 주입
+      # 접속 URL: https://<cloudflare-url>/?token=<JUPYTER_TOKEN>
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-changeme}
+      - JUPYTER_PASSWORD=${JUPYTER_PASSWORD:-}
+
+    volumes:
+      # ── 체크포인트: read-only 마운트 ──────────────────────────────────────
+      # /image/code/ 하위에 마운트 → /workspace/ 바깥이라 JupyterLab 파일 브라우저에서 안 보임
+      # 학습 시 base model로 로드 가능, 다운로드/수정 불가
+      - ../MedSAM2/checkpoints:/image/code/MedSAM2/checkpoints:ro
+      - ../medsam_finetune_lora/model_checkpoints:/image/code/medsam_finetune_lora/model_checkpoints:ro
+
+      # ── 학습 데이터: read-only 마운트 ────────────────────────────────────
+      # /data/ 하위에 마운트 → entrypoint.sh 에서 심볼릭 링크로 연결됨
+      # 스크립트가 기대하는 경로: /workspace/code/labeling_data/
+      #                           /workspace/code/analog/analog_result_24_v1/
+      - ../labeling_data:/data/labeling_data:ro
+      - ../analog/analog_result_24_v1:/data/analog_result_24_v1:ro
+
+      # ── 학습 출력 체크포인트 (/workspace/ 바깥 → 파일 브라우저에서 안 보임) ──
+      # 로컬 beauty/jupyterlab_checkpoint/ 폴더에 날짜별로 저장됨
+      - ../jupyterlab_checkpoint:/checkpoints/output
+
+      # ── 영구 저장 공간: 재시작해도 유지 ──────────────────────────────────
+      # saved_data 볼륨은 Docker가 관리하는 영구 스토리지
+      # .pt 파일은 entrypoint.sh 의 감시 데몬이 삭제함
+      - saved_data:/workspace/saved
+
+    # ── 공유 메모리 설정 ──────────────────────────────────────────────────────
+    # PyTorch DataLoader 워커가 데이터를 공유할 때 /dev/shm 사용
+    # 기본값 64MB로는 대용량 이미지 배치 로딩 시 bus error 발생
+    shm_size: '16gb'
+
+    # ── GPU 설정 ──────────────────────────────────────────────────────────────
+    # NVIDIA Container Toolkit 이 설치되어 있어야 동작
+    # 로컬 GPU를 컨테이너에서 그대로 사용
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # ── 네트워크 설정 ─────────────────────────────────────────────────────────
+    # sandbox-internal 만 연결 → 외부 인터넷 접근 불가
+    # cloudflared 컨테이너를 통해서만 외부와 통신 가능
+    networks:
+      - sandbox-internal
+
+    # JupyterLab 포트는 외부에 직접 노출하지 않음
+    # cloudflared 가 내부 네트워크를 통해 8888 포트에 접근함
+    expose:
+      - "8888"
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/api"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Cloudflare Tunnel 컨테이너 ───────────────────────────────────────────────
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: sandbox-cloudflared
+    # TryCloudflare: 계정/설정 파일 없이 임시 URL 자동 발급
+    # 실행 후 로그에서 URL 확인: docker logs sandbox-cloudflared
+    # 예: https://random-word-abc123.trycloudflare.com
+    command: tunnel --url http://jupyter:8888
+    networks:
+      # sandbox-internal: jupyter 컨테이너(8888)에 접근하기 위해
+      - sandbox-internal
+      # sandbox-external: Cloudflare 서버(인터넷)에 연결하기 위해
+      - sandbox-external
+    depends_on:
+      - jupyter
+    restart: unless-stopped
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 네트워크 정의
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+networks:
+  sandbox-internal:
+    # internal: true → 이 네트워크에만 있는 컨테이너는 외부 인터넷 접근 불가
+    # jupyter 컨테이너가 외부로 파일을 전송하는 것을 원천 차단
+    internal: true
+
+  sandbox-external:
+    # cloudflared 컨테이너 전용 외부 연결 네트워크
+    internal: false
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 볼륨 정의
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+volumes:
+  # 사용자 저장 공간 (재시작해도 유지)
+  saved_data:
