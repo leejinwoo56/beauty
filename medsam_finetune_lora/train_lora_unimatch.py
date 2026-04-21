@@ -19,7 +19,8 @@ UniMatch V2 + MedSAM2 LoRA Semi-Supervised 학습 파이프라인.
 
     L_sup   : labeled frame → forward → BCE+Dice(GT)
     L_unsup : unlabeled weak aug → EMA pseudo-label (sigmoid>0.95)
-              unlabeled strong aug x2 → student → confidence-masked BCE
+              unlabeled strong aug x1 → encode → Complementary Dropout
+              → feat_s1, feat_s2 → decode → confidence-masked BCE x2
 
 실행:
     python train_lora_unimatch.py
@@ -65,10 +66,10 @@ sys.path.insert(0, str(_HERE))
 # output20, output30, output42, output44 → 학습 전용
 TRAIN_OUTPUTS    = ["output20", "output30","output42","output44"]
 VAL_OUTPUTS      = ["output1","output10"]
-EXCLUDE_OUTPUTS  = ["output50", "output53"]   # 학습/검증 모두에서 제외할 output 목록. 예: ["output47"]
+EXCLUDE_OUTPUTS  = []   # 학습/검증 모두에서 제외할 output 목록. 예: ["output47"]
 ANN_ROOT        = str(_ROOT / "labeling_data" / "propagated_masks")
 FRAMES_ROOT     = str(_ROOT / "analog" / "analog_result_24_v1")
-OUTPUT_DIR      = str(_HERE / "model_checkpoints" / "train_lora_unimatch_aug_exclude5053")
+OUTPUT_DIR      = str(_HERE / "model_checkpoints" / "train_lora_unimatch_aug_exclude5053_188")
 MEDSAM2_DIR     = str(_ROOT / "MedSAM2")
 SAM2_CFG        = "configs/sam2.1_hiera_t512.yaml"
 SAM2_CKPT       = str(_ROOT / "MedSAM2" / "checkpoints" / "MedSAM2_US_Heart.pt")
@@ -145,30 +146,6 @@ def _random_crop(h: int, w: int,
     y1 = random.randint(0, h - crop_h)
     x1 = random.randint(0, w - crop_w)
     return y1, y1 + crop_h, x1, x1 + crop_w
-
-
-# ── CutMix ──────────────────────────────────────────────────────────────────
-
-def obtain_cutmix_box(img_size: int, p: float = 0.5,
-                      size_min: float = 0.02, size_max: float = 0.4,
-                      ratio_min: float = 0.3):
-    """
-    CutMix 박스 (x1, y1, x2, y2) 반환. p 확률로 유효, 아니면 (0,0,0,0).
-    """
-    if random.random() > p:
-        return 0, 0, 0, 0
-    area = img_size * img_size
-    for _ in range(10):
-        size   = random.uniform(size_min, size_max) * area
-        ratio  = random.uniform(ratio_min, 1 / ratio_min)
-        w = int(math.sqrt(size * ratio))
-        h = int(math.sqrt(size / ratio))
-        if w > img_size or h > img_size:
-            continue
-        x1 = random.randint(0, img_size - w)
-        y1 = random.randint(0, img_size - h)
-        return x1, y1, x1 + w, y1 + h
-    return 0, 0, 0, 0
 
 
 # ── Strong Augmentation (초음파용) ──────────────────────────────────────────
@@ -265,10 +242,10 @@ class SMASUnlabeledDataset(Dataset):
     result_resolution/output{N}/frames/ 전체 프레임 중
     labeled_pairs 에 없는 프레임 = unlabeled 데이터.
 
-    반환: (img_w, img_s1, img_s2, cutmix_box1, cutmix_box2)
-        img_w  : weak aug (flip only)
-        img_s1 : strong aug + CutMix box1
-        img_s2 : strong aug + CutMix box2
+    반환: (img_w, img_s)
+        img_w : weak aug (flip only) → Teacher pseudo-label 생성용
+        img_s : strong aug x1       → Student encode 입력용
+                                      (채널 드롭아웃은 train loop에서 피처 레벨로 처리)
     """
 
     def __init__(self, frames_root: str, labeled_pairs: set,
@@ -298,15 +275,10 @@ class SMASUnlabeledDataset(Dataset):
         if random.random() < 0.5:
             img_w = torch.flip(img_w, dims=[-1])
 
-        # strong aug x2
-        img_s1 = strong_aug(img_w.clone())
-        img_s2 = strong_aug(img_w.clone())
+        # strong aug x1 (두 번째 뷰는 피처 레벨 Complementary Dropout으로 생성)
+        img_s = strong_aug(img_w.clone())
 
-        # CutMix 박스
-        b1 = obtain_cutmix_box(self.img_size)
-        b2 = obtain_cutmix_box(self.img_size)
-
-        return img_w, img_s1, img_s2, torch.tensor(b1), torch.tensor(b2)
+        return img_w, img_s
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -337,14 +309,17 @@ class BCEDiceLoss(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. Forward pass (train_lora.py와 동일 로직, 독립 구현)
+# 3. Forward pass — 인코더 / 디코더 분리
 # ──────────────────────────────────────────────────────────────────────────────
 
-def forward_single(model, images: torch.Tensor) -> torch.Tensor:
-    """[B,3,512,512] → [B,1,512,512] logits (sigmoid 전)."""
-    B      = images.shape[0]
-    device = images.device
-
+def encode(model, images: torch.Tensor):
+    """
+    이미지 → 인코더 피처.
+    반환: (pix_feat, high_res_features, feat_sizes)
+        pix_feat         : [B, C, H_f, W_f]  메모리 조건화된 메인 피처
+        high_res_features: [fpn_0, fpn_1]     FPN 고해상도 피처 (디코더용)
+        feat_sizes       : [(H0,W0), ...]     각 레벨 공간 크기
+    """
     backbone_out = model.forward_image(images)
     _, vision_feats, vision_pos_embeds, feat_sizes = \
         model._prepare_backbone_features(backbone_out)
@@ -360,6 +335,18 @@ def forward_single(model, images: torch.Tensor) -> torch.Tensor:
 
     high_res_features = [backbone_out["backbone_fpn"][0],
                          backbone_out["backbone_fpn"][1]]
+
+    return pix_feat, high_res_features, feat_sizes
+
+
+def decode(model, pix_feat: torch.Tensor,
+           high_res_features: list, feat_sizes: list) -> torch.Tensor:
+    """
+    피처 → [B, 1, img_size, img_size] logits.
+    pix_feat를 교체해서 호출하면 Complementary Dropout 뷰를 따로 디코딩할 수 있다.
+    """
+    B      = pix_feat.shape[0]
+    device = pix_feat.device
 
     H, W = feat_sizes[-1]
     sparse = model.default_prompt_embedding.to(device).expand(B, -1, -1)
@@ -378,6 +365,12 @@ def forward_single(model, images: torch.Tensor) -> torch.Tensor:
     low_res = low_res.float()
     return F.interpolate(low_res, size=(model.image_size, model.image_size),
                          mode="bilinear", align_corners=False)
+
+
+def forward_single(model, images: torch.Tensor) -> torch.Tensor:
+    """[B,3,512,512] → [B,1,512,512] logits. supervised 및 validate 전용."""
+    pix_feat, high_res_features, feat_sizes = encode(model, images)
+    return decode(model, pix_feat, high_res_features, feat_sizes)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -479,14 +472,12 @@ def train_epoch(student, teacher, labeled_loader, unlabeled_loader,
     for batch_idx in range(n_batches):
         # ── 데이터 로드 ──
         img_x, mask_x = next(labeled_iter)
-        img_u_w, img_u_s1, img_u_s2, box1, box2 = next(unlabeled_iter)
+        img_u_w, img_u_s = next(unlabeled_iter)
 
-        img_x    = img_x.to(device)
-        mask_x   = mask_x.to(device)
-        img_u_w  = img_u_w.to(device)
-        img_u_s1 = img_u_s1.to(device)
-        img_u_s2 = img_u_s2.to(device)
-        B_u = img_u_w.shape[0]
+        img_x   = img_x.to(device)
+        mask_x  = mask_x.to(device)
+        img_u_w = img_u_w.to(device)
+        img_u_s = img_u_s.to(device)
 
         optimizer.zero_grad()
 
@@ -494,7 +485,7 @@ def train_epoch(student, teacher, labeled_loader, unlabeled_loader,
                             enabled=(device.type == "cuda")):
 
             # ── Supervised loss ──
-            pred_x  = forward_single(student, img_x)
+            pred_x   = forward_single(student, img_x)
             loss_sup = criterion(pred_x, mask_x)
 
             # ── Pseudo-label (EMA teacher, no grad) ──
@@ -512,19 +503,28 @@ def train_epoch(student, teacher, labeled_loader, unlabeled_loader,
                   f"threshold({CONF_THRESH}) 통과: {int(valid_px)}/{total_px} "
                   f"({100*valid_px/total_px:.2f}%)")
 
-            # ── CutMix 적용 ──
-            img_u_s1, pseudo_s1, conf_s1 = _apply_cutmix(
-                img_u_s1, pseudo_u_w, conf_u_w, box1)
-            img_u_s2, pseudo_s2, conf_s2 = _apply_cutmix(
-                img_u_s2, pseudo_u_w, conf_u_w, box2)
+            # ── Student: 인코더 1회 통과 → 피처 획득 ──
+            pix_feat, high_res_feats, feat_sizes = encode(student, img_u_s)
 
-            # ── Student: strong aug 예측 ──
-            pred_u_s1 = forward_single(student, img_u_s1)
-            pred_u_s2 = forward_single(student, img_u_s2)
+            # ── Complementary Dropout (UniMatch V2 핵심 로직) ──
+            # 채널 차원으로 이진 마스크 M을 생성하고, 상보적 두 뷰를 만든다.
+            # feat_s1 = feat * M * 2,  feat_s2 = feat * (1-M) * 2
+            # → 두 뷰의 기댓값이 원본 feat와 동일하도록 ×2 스케일링
+            C = pix_feat.shape[1]
+            B_u = pix_feat.shape[0]
+            mask_m = torch.distributions.binomial.Binomial(
+                1, 0.5 * torch.ones(B_u, C, 1, 1, device=device)
+            ).sample()
+            feat_s1 = pix_feat * mask_m * 2.0
+            feat_s2 = pix_feat * (1.0 - mask_m) * 2.0
 
-            # ── Confidence-masked BCE (신뢰도 낮은 픽셀 제외) ──
-            loss_u_s1 = _masked_bce(pred_u_s1, pseudo_s1, conf_s1)
-            loss_u_s2 = _masked_bce(pred_u_s2, pseudo_s2, conf_s2)
+            # ── 디코더: 두 뷰 각각 예측 ──
+            pred_u_s1 = decode(student, feat_s1, high_res_feats, feat_sizes)
+            pred_u_s2 = decode(student, feat_s2, high_res_feats, feat_sizes)
+
+            # ── Confidence-masked BCE: 두 뷰 모두 동일한 pseudo-label과 비교 ──
+            loss_u_s1  = _masked_bce(pred_u_s1, pseudo_u_w, conf_u_w)
+            loss_u_s2  = _masked_bce(pred_u_s2, pseudo_u_w, conf_u_w)
             loss_unsup = (loss_u_s1 + loss_u_s2) / 2.0
 
             loss = (loss_sup + loss_unsup) / 2.0
@@ -546,26 +546,6 @@ def train_epoch(student, teacher, labeled_loader, unlabeled_loader,
 
     n = max(n_batches, 1)
     return total_loss / n, total_sup / n, total_unsup / n, global_step
-
-
-def _apply_cutmix(img_s, pseudo, conf, box):
-    """CutMix: img_s의 box 영역을 배치 내 flip(0) 이미지로 교체."""
-    x1, y1, x2, y2 = box[:, 0], box[:, 1], box[:, 2], box[:, 3]
-    img_s    = img_s.clone()
-    pseudo   = pseudo.clone()
-    conf     = conf.clone()
-    img_flip = img_s.flip(0)
-    ps_flip  = pseudo.flip(0)
-    cf_flip  = conf.flip(0)
-
-    for i in range(img_s.shape[0]):
-        x1i, y1i, x2i, y2i = x1[i].item(), y1[i].item(), x2[i].item(), y2[i].item()
-        if x2i > x1i and y2i > y1i:
-            img_s[i, :, y1i:y2i, x1i:x2i]  = img_flip[i, :, y1i:y2i, x1i:x2i]
-            pseudo[i, :, y1i:y2i, x1i:x2i] = ps_flip[i, :, y1i:y2i, x1i:x2i]
-            conf[i, :, y1i:y2i, x1i:x2i]   = cf_flip[i, :, y1i:y2i, x1i:x2i]
-
-    return img_s, pseudo, conf
 
 
 def _masked_bce(logits, pseudo, conf):

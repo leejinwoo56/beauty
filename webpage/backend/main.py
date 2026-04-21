@@ -15,6 +15,8 @@ API 구조:
 """
 #deploy
 import uuid
+import re
+import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +28,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from inference import load_models, process_video
+
+# ── 보안 설정 ──────────────────────────────────────────────────────────────────
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+_ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
+
+def _validate_job_id(job_id: str):
+    """job_id가 UUID v4 형식인지 검사. Path Traversal 공격 방지."""
+    if not _UUID_RE.match(job_id):
+        raise HTTPException(status_code=400, detail="유효하지 않은 job_id 형식")
 
 # ── 디렉토리 준비 ──────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent
@@ -80,10 +91,10 @@ app = FastAPI(
 # (AWS 배포 후에는 실제 도메인으로 제한할 것)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST", "GET"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # 프론트엔드 정적 파일 서빙 (HTML/CSS/JS)
@@ -161,6 +172,7 @@ def get_status(job_id: str):
     상태값: "pending" → "processing" → "done" | "error: ..."
     클라이언트는 이 엔드포인트를 주기적으로 호출(폴링)해서 완료 여부 확인.
     """
+    _validate_job_id(job_id)
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="존재하지 않는 job_id")
     return {"job_id": job_id, "status": jobs[job_id]}
@@ -172,6 +184,8 @@ def get_result(job_id: str):
     완료된 결과 영상 다운로드.
     done 상태일 때만 파일을 반환하고, 그 외에는 오류 반환.
     """
+    _validate_job_id(job_id)
+
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="존재하지 않는 job_id")
 
@@ -180,6 +194,9 @@ def get_result(job_id: str):
         raise HTTPException(status_code=400, detail=f"아직 준비되지 않음: {status}")
 
     result_path = RESULT_DIR / f"{job_id}_result.mp4"
+    # 실제 경로가 RESULT_DIR 안에 있는지 이중 확인 (symlink 공격 방지)
+    if not result_path.resolve().is_relative_to(RESULT_DIR.resolve()):
+        raise HTTPException(status_code=403, detail="접근 거부")
     if not result_path.exists():
         raise HTTPException(status_code=404, detail="결과 파일 없음")
 

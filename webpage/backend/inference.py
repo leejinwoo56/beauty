@@ -12,9 +12,16 @@ infer_lora_video.py의 AI 추론 로직을 FastAPI용으로 분리한 모듈.
 
 import os
 import sys
+import platform
 import tempfile
 import shutil
 import subprocess
+
+# OS에 따라 ffmpeg/ffprobe 경로 결정
+# Linux(EC2)는 절대경로, Windows는 PATH에서 찾음
+_IS_LINUX = platform.system() == "Linux"
+_FFMPEG  = "/usr/bin/ffmpeg"  if _IS_LINUX else "ffmpeg"
+_FFPROBE = "/usr/bin/ffprobe" if _IS_LINUX else "ffprobe"
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -205,7 +212,7 @@ def extract_frames(video_path: str, frames_dir: str):
 
     # ffmpeg로 fps/해상도 추출
     probe_cmd = [
-        "/usr/bin/ffprobe", "-v", "error",
+        _FFPROBE, "-v", "error",
         "-select_streams", "v:0",
         "-show_entries", "stream=width,height,r_frame_rate",
         "-of", "csv=p=0",
@@ -219,7 +226,7 @@ def extract_frames(video_path: str, frames_dir: str):
 
     # ffmpeg로 프레임 추출
     cmd = [
-        "/usr/bin/ffmpeg", "-y", "-i", video_path,
+        _FFMPEG, "-y", "-i", video_path,
         str(Path(frames_dir) / "frame_%05d.png")
     ]
     result2 = subprocess.run(cmd, capture_output=True, text=True)
@@ -320,7 +327,7 @@ def _reencode_to_h264(video_path: str):
     """
     tmp_path = video_path.replace(".mp4", "_tmp.mp4")
     cmd = [
-        "/usr/bin/ffmpeg", "-y",           # -y: 덮어쓰기 확인 없이 진행
+        _FFMPEG, "-y",           # -y: 덮어쓰기 확인 없이 진행
         "-i", video_path,         # 입력: mp4v 파일
         "-vcodec", "libx264",     # 출력 코덱: H.264
         "-crf", "23",             # 화질 (낮을수록 고화질, 18~28 권장)
