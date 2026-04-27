@@ -55,7 +55,8 @@ class LoRAQKV(nn.Module):
         self.lora_v_A = nn.Linear(in_dim, r, bias=False)
         self.lora_v_B = nn.Linear(r, out_dim, bias=False)
 
-        self.scale = lora_alpha / r
+        # float 대신 buffer로 등록 — inductor가 float scalar를 quantization scale로 오인하는 버그 방지
+        self.register_buffer("scale", torch.tensor(lora_alpha / r))
 
         # 초기화: A ~ Kaiming uniform, B = 0 (처음엔 delta = 0)
         nn.init.kaiming_uniform_(self.lora_q_A.weight, a=math.sqrt(5))
